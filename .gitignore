@@ -1,0 +1,52 @@
+# Dependency directories
+node_modules/
+**/node_modules/
+
+# Build outputs
+dist/
+**/dist/
+build/
+**/build/
+out/
+**/out/
+
+# Environment files
+.env
+.env*.local
+**/.env
+**/.env*.local
+
+# Firebase / Cloud Storage Configuration
+.firebase/
+**/.firebase/
+firebase-debug.log*
+.runtimeconfig.json
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.qodo/
+
+# System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Test coverage
+coverage/
+**/coverage/
+.nyc_output/
