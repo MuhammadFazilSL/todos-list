@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
+import { randomUUID } from 'crypto';
 
 export interface TodoListDoc {
   id: string;
@@ -12,20 +13,18 @@ export interface TodoListDoc {
 @Injectable()
 export class TodoListsRepository {
   private readonly logger = new Logger(TodoListsRepository.name);
-  private readonly collectionName = 'todo_lists';
+  private readonly tableName = 'todo_lists';
   private mockStore = new Map<string, TodoListDoc[]>(); // Fallback in-memory DB for offline compilation/testing
 
-  constructor(private readonly firebaseService: FirebaseService) {}
+  constructor(private readonly supabaseService: SupabaseService) {}
 
-  private get collection() {
-    const db = this.firebaseService.firestore;
-    if (!db) return null;
-    return db.collection(this.collectionName);
+  private get client() {
+    return this.supabaseService.getClient();
   }
 
   async create(userId: string, name: string, description: string): Promise<TodoListDoc> {
-    const coll = this.collection;
-    const listId = coll ? coll.doc().id : 'list-' + Date.now();
+    const client = this.client;
+    const listId = client ? randomUUID() : 'list-' + Date.now();
     const doc: TodoListDoc = {
       id: listId,
       userId,
@@ -34,7 +33,7 @@ export class TodoListsRepository {
       createdAt: new Date().toISOString(),
     };
 
-    if (!coll) {
+    if (!client) {
       if (!this.mockStore.has(userId)) {
         this.mockStore.set(userId, []);
       }
@@ -42,23 +41,34 @@ export class TodoListsRepository {
       return doc;
     }
 
-    await coll.doc(listId).set(doc);
+    const { error } = await client.from(this.tableName).insert(doc);
+    if (error) {
+      throw new Error(`Failed to create todo list: ${error.message}`);
+    }
     return doc;
   }
 
   async findAllByUser(userId: string): Promise<TodoListDoc[]> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       return this.mockStore.get(userId) || [];
     }
 
-    const snapshot = await coll.where('userId', '==', userId).orderBy('createdAt', 'desc').get();
-    return snapshot.docs.map((d) => d.data() as TodoListDoc);
+    const { data, error } = await client
+      .from(this.tableName)
+      .select('*')
+      .eq('userId', userId)
+      .order('createdAt', { ascending: false });
+
+    if (error) {
+      throw new Error(`Failed to fetch todo lists: ${error.message}`);
+    }
+    return data || [];
   }
 
   async findById(listId: string): Promise<TodoListDoc | null> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       for (const lists of this.mockStore.values()) {
         const found = lists.find((l) => l.id === listId);
         if (found) return found;
@@ -66,18 +76,25 @@ export class TodoListsRepository {
       return null;
     }
 
-    const doc = await coll.doc(listId).get();
-    if (!doc.exists) return null;
-    return doc.data() as TodoListDoc;
+    const { data, error } = await client
+      .from(this.tableName)
+      .select('*')
+      .eq('id', listId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to find todo list: ${error.message}`);
+    }
+    return data;
   }
 
   async update(listId: string, name?: string, description?: string): Promise<TodoListDoc | null> {
-    const coll = this.collection;
+    const client = this.client;
     const updates: Partial<TodoListDoc> = {};
     if (name !== undefined) updates.name = name;
     if (description !== undefined) updates.description = description;
 
-    if (!coll) {
+    if (!client) {
       for (const lists of this.mockStore.values()) {
         const index = lists.findIndex((l) => l.id === listId);
         if (index !== -1) {
@@ -88,18 +105,22 @@ export class TodoListsRepository {
       return null;
     }
 
-    const docRef = coll.doc(listId);
-    const doc = await docRef.get();
-    if (!doc.exists) return null;
+    const { data, error } = await client
+      .from(this.tableName)
+      .update(updates)
+      .eq('id', listId)
+      .select()
+      .maybeSingle();
 
-    await docRef.update(updates);
-    const updatedDoc = await docRef.get();
-    return updatedDoc.data() as TodoListDoc;
+    if (error) {
+      throw new Error(`Failed to update todo list: ${error.message}`);
+    }
+    return data;
   }
 
   async delete(listId: string): Promise<boolean> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       for (const [userId, lists] of this.mockStore.entries()) {
         const index = lists.findIndex((l) => l.id === listId);
         if (index !== -1) {
@@ -111,20 +132,27 @@ export class TodoListsRepository {
       return false;
     }
 
-    const docRef = coll.doc(listId);
-    const doc = await docRef.get();
-    if (!doc.exists) return false;
+    const existing = await this.findById(listId);
+    if (!existing) return false;
 
-    // First delete the lists entry itself
-    await docRef.delete();
+    const { error } = await client
+      .from(this.tableName)
+      .delete()
+      .eq('id', listId);
+
+    if (error) {
+      throw new Error(`Failed to delete todo list: ${error.message}`);
+    }
     
     // Attempt deleting all associated todos under this list
     try {
-      const todosColl = this.firebaseService.firestore.collection('todos');
-      const todosSnapshot = await todosColl.where('listId', '==', listId).get();
-      const batch = this.firebaseService.firestore.batch();
-      todosSnapshot.docs.forEach((d) => batch.delete(d.ref));
-      await batch.commit();
+      const { error: todosDeleteError } = await client
+        .from('todos')
+        .delete()
+        .eq('listId', listId);
+      if (todosDeleteError) {
+        this.logger.warn(`Could not clean up cascading todos for list ${listId}: ${todosDeleteError.message}`);
+      }
     } catch (e) {
       this.logger.warn(`Could not clean up cascading todos for list ${listId}: ${e.message}`);
     }

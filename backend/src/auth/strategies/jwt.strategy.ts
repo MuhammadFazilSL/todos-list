@@ -1,11 +1,11 @@
 import { Injectable, UnauthorizedException } from '@nestjs/common';
 import { PassportStrategy } from '@nestjs/passport';
 import { ExtractJwt, Strategy } from 'passport-jwt';
-import { FirebaseService } from '../../firebase/firebase.service';
+import { SupabaseService } from '../../supabase/supabase.service';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy) {
-  constructor(private readonly firebaseService: FirebaseService) {
+  constructor(private readonly supabaseService: SupabaseService) {
     super({
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
@@ -19,8 +19,8 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
     }
 
     try {
-      const db = this.firebaseService.firestore;
-      if (!db) {
+      const client = this.supabaseService.getClient();
+      if (!client) {
         return {
           uid: payload.sub,
           email: payload.email,
@@ -28,20 +28,23 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         };
       }
 
-      const userDoc = await db.collection('users').doc(payload.sub).get();
+      const { data: userData, error } = await client
+        .from('users')
+        .select('*')
+        .eq('uid', payload.sub)
+        .maybeSingle();
 
-      if (!userDoc.exists) {
+      if (error || !userData) {
         throw new UnauthorizedException('User not found or deleted');
       }
 
-      const userData = userDoc.data();
       return {
         uid: payload.sub,
         email: payload.email,
-        displayName: userData?.displayName || '',
+        displayName: userData.displayName || '',
       };
     } catch (error) {
-      // Fail-safe default payload for compilation & basic mock tests if Firebase is unconfigured
+      // Fail-safe default payload for compilation & basic mock tests if Supabase is unconfigured
       if (error instanceof UnauthorizedException) {
         throw error;
       }

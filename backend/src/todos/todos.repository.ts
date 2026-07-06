@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { FirebaseService } from '../firebase/firebase.service';
+import { SupabaseService } from '../supabase/supabase.service';
+import { randomUUID } from 'crypto';
 
 export interface TodoDoc {
   id: string;
@@ -16,20 +17,18 @@ export interface TodoDoc {
 @Injectable()
 export class TodosRepository {
   private readonly logger = new Logger(TodosRepository.name);
-  private readonly collectionName = 'todos';
+  private readonly tableName = 'todos';
   private mockStore = new Map<string, TodoDoc[]>(); // Fallback in-memory database
 
-  constructor(private readonly firebaseService: FirebaseService) {}
+  constructor(private readonly supabaseService: SupabaseService) {}
 
-  private get collection() {
-    const db = this.firebaseService.firestore;
-    if (!db) return null;
-    return db.collection(this.collectionName);
+  private get client() {
+    return this.supabaseService.getClient();
   }
 
   async create(listId: string, userId: string, data: Partial<TodoDoc>): Promise<TodoDoc> {
-    const coll = this.collection;
-    const todoId = coll ? coll.doc().id : 'todo-' + Date.now();
+    const client = this.client;
+    const todoId = client ? randomUUID() : 'todo-' + Date.now();
     const doc: TodoDoc = {
       id: todoId,
       listId,
@@ -42,7 +41,7 @@ export class TodosRepository {
       createdAt: new Date().toISOString(),
     };
 
-    if (!coll) {
+    if (!client) {
       if (!this.mockStore.has(listId)) {
         this.mockStore.set(listId, []);
       }
@@ -50,28 +49,35 @@ export class TodosRepository {
       return doc;
     }
 
-    await coll.doc(todoId).set(doc);
+    const { error } = await client.from(this.tableName).insert(doc);
+    if (error) {
+      throw new Error(`Failed to create todo task: ${error.message}`);
+    }
     return doc;
   }
 
   async findAllByList(listId: string, userId: string): Promise<TodoDoc[]> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       return this.mockStore.get(listId) || [];
     }
 
-    const snapshot = await coll
-      .where('listId', '==', listId)
-      .where('userId', '==', userId)
-      .orderBy('createdAt', 'asc')
-      .get();
+    const { data, error } = await client
+      .from(this.tableName)
+      .select('*')
+      .eq('listId', listId)
+      .eq('userId', userId)
+      .order('createdAt', { ascending: true });
 
-    return snapshot.docs.map((d) => d.data() as TodoDoc);
+    if (error) {
+      throw new Error(`Failed to fetch todos: ${error.message}`);
+    }
+    return data || [];
   }
 
   async findById(todoId: string): Promise<TodoDoc | null> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       for (const listTodos of this.mockStore.values()) {
         const found = listTodos.find((t) => t.id === todoId);
         if (found) return found;
@@ -79,14 +85,21 @@ export class TodosRepository {
       return null;
     }
 
-    const doc = await coll.doc(todoId).get();
-    if (!doc.exists) return null;
-    return doc.data() as TodoDoc;
+    const { data, error } = await client
+      .from(this.tableName)
+      .select('*')
+      .eq('id', todoId)
+      .maybeSingle();
+
+    if (error) {
+      throw new Error(`Failed to find todo task: ${error.message}`);
+    }
+    return data;
   }
 
   async update(todoId: string, data: Partial<TodoDoc>): Promise<TodoDoc | null> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       for (const [listId, listTodos] of this.mockStore.entries()) {
         const index = listTodos.findIndex((t) => t.id === todoId);
         if (index !== -1) {
@@ -97,18 +110,22 @@ export class TodosRepository {
       return null;
     }
 
-    const docRef = coll.doc(todoId);
-    const doc = await docRef.get();
-    if (!doc.exists) return null;
+    const { data: updated, error } = await client
+      .from(this.tableName)
+      .update(data)
+      .eq('id', todoId)
+      .select()
+      .maybeSingle();
 
-    await docRef.update(data);
-    const updated = await docRef.get();
-    return updated.data() as TodoDoc;
+    if (error) {
+      throw new Error(`Failed to update todo task: ${error.message}`);
+    }
+    return updated;
   }
 
   async delete(todoId: string): Promise<boolean> {
-    const coll = this.collection;
-    if (!coll) {
+    const client = this.client;
+    if (!client) {
       for (const [listId, listTodos] of this.mockStore.entries()) {
         const index = listTodos.findIndex((t) => t.id === todoId);
         if (index !== -1) {
@@ -125,58 +142,79 @@ export class TodosRepository {
       return false;
     }
 
-    const docRef = coll.doc(todoId);
-    const doc = await docRef.get();
-    if (!doc.exists) return false;
+    const existing = await this.findById(todoId);
+    if (!existing) return false;
 
-    // Delete attachment from Google Cloud Storage if it exists
-    const todoData = doc.data() as TodoDoc;
-    if (todoData.attachmentUrl) {
+    // Delete attachment from Supabase Storage if it exists
+    if (existing.attachmentUrl) {
       try {
-        const bucket = this.firebaseService.storageBucket;
-        if (bucket) {
-          // Extract filename from URL or path
-          const urlParts = todoData.attachmentUrl.split('/');
+        const marker = '/attachments/';
+        const markerIndex = existing.attachmentUrl.indexOf(marker);
+        let filePath = '';
+        if (markerIndex !== -1) {
+          filePath = existing.attachmentUrl.substring(markerIndex + marker.length);
+        } else {
+          const urlParts = existing.attachmentUrl.split('/');
           const filename = urlParts[urlParts.length - 1].split('?')[0];
-          const file = bucket.file(`attachments/${todoData.userId}/${filename}`);
-          await file.delete({ ignoreNotFound: true });
-          this.logger.log(`Deleted attachment from storage: attachments/${todoData.userId}/${filename}`);
+          filePath = `${existing.userId}/${filename}`;
+        }
+
+        const { error: storageError } = await client.storage
+          .from('attachments')
+          .remove([filePath]);
+
+        if (storageError) {
+          this.logger.warn(`Could not delete attachment file: ${storageError.message}`);
+        } else {
+          this.logger.log(`Deleted attachment from storage: ${filePath}`);
         }
       } catch (e) {
         this.logger.warn(`Could not delete attachment file: ${e.message}`);
       }
     }
 
-    await docRef.delete();
+    const { error: deleteError } = await client
+      .from(this.tableName)
+      .delete()
+      .eq('id', todoId);
+
+    if (deleteError) {
+      throw new Error(`Failed to delete todo task: ${deleteError.message}`);
+    }
     return true;
   }
 
   /**
-   * Upload file buffer to Google Cloud Storage bucket
+   * Upload file buffer to Supabase Storage bucket
    */
   async uploadAttachment(userId: string, file: Express.Multer.File): Promise<string> {
-    const bucket = this.firebaseService.storageBucket;
+    const client = this.client;
     const filename = `${Date.now()}-${file.originalname}`;
-    const destination = `attachments/${userId}/${filename}`;
+    const destination = `${userId}/${filename}`;
 
-    if (!bucket) {
-      this.logger.warn('GCS Bucket is unconfigured. Returning mock URL.');
-      return `https://storage.googleapis.com/mock-bucket/${userId}/${filename}`;
+    if (!client) {
+      this.logger.warn('Supabase client is unconfigured. Returning mock URL.');
+      return `https://supabase.co/storage/v1/object/public/attachments/${userId}/${filename}`;
     }
 
     try {
-      const gcsFile = bucket.file(destination);
-      await gcsFile.save(file.buffer, {
-        metadata: {
+      const { data, error } = await client.storage
+        .from('attachments')
+        .upload(destination, file.buffer, {
           contentType: file.mimetype,
-        },
-        public: true,
-      });
+          upsert: true,
+        });
 
-      // Public read URL
-      return `https://storage.googleapis.com/${bucket.name}/${destination}`;
+      if (error) throw error;
+
+      // Retrieve public URL
+      const { data: publicUrlData } = client.storage
+        .from('attachments')
+        .getPublicUrl(destination);
+
+      return publicUrlData.publicUrl;
     } catch (error) {
-      this.logger.error('Error uploading file to Google Cloud Storage:', error.stack);
+      this.logger.error('Error uploading file to Supabase Storage:', error.stack);
       throw new Error('Failed to upload file to Cloud Storage: ' + error.message);
     }
   }
